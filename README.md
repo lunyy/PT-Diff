@@ -8,7 +8,6 @@
 ### 🔹 **Global Configuration**
 | Hyperparameter | Value |
 |--------------|----|
-| `gpu_id` | 2 |
 | `vae_epochs` | 200 |
 | `cond_epochs` | 1000 |
 | `batch_size` | 16 |
@@ -24,14 +23,13 @@
 ### 🔹 **1. Personalized FC Variational Graph Autoencoder**
 | Hyperparameter | Value |
 |--------------|----|
-| `in_channels` | `train_dataset.data_list[0].x.shape[1]` (Node feature dimension) |
+| `in_channels` | 116|
 | `hidden_channels` | 32 |
 | `embed_channels` | 8 |
 | `original_feature_dim` | `in_channels` |
 | `num_nodes` | 116 |
-| `device` | `'cuda'` or `'cpu'` |
-| **Edge Decoder** Hidden Dim | 64 |
-| **Node Decoder** Hidden Dim | 64 |
+| **Topology Decoder** Hidden Dim | 64 |
+| **FC Decoder** Hidden Dim | 64 |
 
 ---
 
