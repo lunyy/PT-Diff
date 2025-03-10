@@ -3,12 +3,6 @@
 ![image](https://github.com/user-attachments/assets/7dfdde82-eb32-4331-b2c2-9386d1bc2eed)
 
 
-# 🧠 Personalized FC Variational Graph Autoencoder with Classifier-Free Diffusion
-
-This project implements a **Personalized Functional Connectivity Variational Graph Autoencoder** combined with **Classifier-Free Guided Diffusion** to generate node and edge embeddings. The diffusion model enhances the generated graph structures.
-
----
-
 ## 📌 Hyperparameter Summary
 
 ### 🔹 **Global Configuration**
