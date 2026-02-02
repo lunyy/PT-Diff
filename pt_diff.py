@@ -607,7 +607,7 @@ def main():
             print(f"\n=== Training with seed={seed}, fold={fold_idx+1}/{num_folds} ===")
             result_dir = (
                 f"/yourpath"
-                f"fold_{fold_idx}_sw_{config['sw_loss']}_ID_drop_{config['cond_drop_prob']}"
+                f"fold_{fold_idx}_ID_drop_{config['cond_drop_prob']}"
                 f"_timestep_{config['timesteps']}_diff_{config['cond_epochs']}_emb_{config['embed_channels']}"
                 f"_hidden_{config['hidden_channels']}_vae{config['vae_epochs']}_cfg_{config['guidance_scale']}"
                 f"/diff_cond_seed_{seed}"
@@ -634,7 +634,6 @@ def main():
             hidden_channels = config["hidden_channels"]
             embed_channels = config["embed_channels"]
             num_nodes = config["num_nodes"]
-            sw_ratio = config["sw_loss"]
 
             model = PT_GraphVAE(in_channels, hidden_channels, embed_channels, in_channels, num_nodes, device).to(device)
             initialize_weights(model)
@@ -883,7 +882,6 @@ if __name__ == "__main__":
             "gpu_id": {"values": [0]},
             "vae_epochs": {"values": [300]},
             "cond_epochs": {"values": [1000]},
-            "sw_loss": {"values": [0]},
             "batch_size": {"values": [64]},
             "sample_batch_size": {"values": [64]},
             "learning_rate_gae": {"values": [1e-4]},
