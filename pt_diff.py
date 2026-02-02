@@ -116,7 +116,7 @@ class GraphDataset(Dataset):
                 i, j = np.triu_indices(node_features.shape[0], k=1)
                 non_zero_values = np.abs(node_features)[i, j]
                 non_zero_values = non_zero_values[non_zero_values != 0]
-                threshold = np.percentile(non_zero_values, 40)
+                threshold = np.percentile(non_zero_values, 90)
 
                 upper_tri = np.zeros_like(node_features, dtype=bool)
                 upper_tri[i, j] = np.abs(node_features)[i, j] > threshold
