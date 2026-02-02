@@ -57,7 +57,6 @@ sweep_config = {
         'timesteps': {'values': [200]},
         'emb': {'values': [32]},
         'vae_epochs': {'values': [300]},
-        'sw_loss': {'values': [0]},
     }
 }
 
@@ -390,7 +389,6 @@ def train_and_evaluate_all_seeds_and_folds():
     timestep = cfg.timesteps
     emb = cfg.emb
     vae = cfg.vae_epochs
-    sw_loss = cfg.sw_loss
 
     num_folds = 5
     fold_results = []
@@ -408,7 +406,7 @@ def train_and_evaluate_all_seeds_and_folds():
         augmented_dataset = load_augmented_abide_data(
             100,
             f"/yourpath"
-            f"hub_0_gamma_1_fold_{fold_idx}_sw_{sw_loss}_ID_drop_{drop_prob}_timestep_{timestep}"
+            f"fold_{fold_idx}_ID_drop_{drop_prob}_timestep_{timestep}"
             f"_diff_{diffusion_epoch}_emb_{emb}_hidden_64_vae{vae}_cfg_{guidance_scale}",
             diffusion_epoch,
             edge_threshold_percentile
