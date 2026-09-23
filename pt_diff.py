@@ -116,7 +116,7 @@ class GraphDataset(Dataset):
                 i, j = np.triu_indices(node_features.shape[0], k=1)
                 non_zero_values = np.abs(node_features)[i, j]
                 non_zero_values = non_zero_values[non_zero_values != 0]
-                threshold = np.percentile(non_zero_values, 90)
+                threshold = np.percentile(non_zero_values, 40)
 
                 upper_tri = np.zeros_like(node_features, dtype=bool)
                 upper_tri[i, j] = np.abs(node_features)[i, j] > threshold
@@ -676,7 +676,7 @@ def main():
             latent_std_b = latent_std.view(1, 1, D)
             print("[Latent stats] mean|std:", float(latent_mean.abs().mean()), float(latent_std.mean()))
 
-            rho_fixed = 0.1
+            rho_fixed = 0.6
             cond_enc = EnhancedConditionEncoder().to(device)
             eps_model = NodeTransformerEps(
                 latent_dim=embed_channels * 2,
