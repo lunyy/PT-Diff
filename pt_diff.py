@@ -1,6 +1,8 @@
+import argparse
 import os
 import math
 import random
+from pathlib import Path
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -21,6 +23,26 @@ import wandb
 from datetime import datetime
 
 
+EDGE_RATIO = 0.10
+
+
+def fixed_upper_edge_count(num_nodes):
+    possible = num_nodes * (num_nodes - 1) // 2
+    return max(1, round(EDGE_RATIO * possible)) if possible else 0
+
+
+def fc_topk_edges(features):
+    num_nodes = features.shape[0]
+    row, col = np.triu_indices(num_nodes, k=1)
+    scores = np.abs(features[row, col])
+    selected = np.argsort(-scores, kind="stable")[:fixed_upper_edge_count(num_nodes)]
+    upper = np.stack([row[selected], col[selected]], axis=0)
+    reverse = upper[[1, 0]]
+    nodes = np.arange(num_nodes)
+    loops = np.stack([nodes, nodes], axis=0)
+    return np.concatenate([upper, reverse, loops], axis=1)
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -36,12 +58,6 @@ def set_seed(seed):
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
-def worker_init_fn(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
 def initialize_weights(model):
     for name, param in model.named_parameters():
         if 'weight' in name and param.dim() > 1:
@@ -50,15 +66,12 @@ def initialize_weights(model):
             nn.init.constant_(param, 0)
 
 
-def load_abide_list(data_type, fold_idx=0, num_folds=5, seed=100):
-    data_dir = '/yourpath'
-    phenotype_path = '/yourpath'
-
-    df = pd.read_csv(phenotype_path)
+def load_abide_list(data_type, data_dir, phenotype_csv, fold_idx=0, num_folds=5, seed=100):
+    df = pd.read_csv(phenotype_csv)
     df['FILE_ID'] = df['FILE_ID'].astype(str).str.strip()
     df = df.set_index('FILE_ID', drop=False)
 
-    all_files = [f for f in os.listdir(data_dir) if f.endswith('_rois_aal.1D')]
+    all_files = sorted(f.name for f in data_dir.glob('*_rois_aal.1D'))
     valid_files, labels = [], []
     for filename in all_files:
         file_id = filename.replace('_rois_aal.1D', '').strip()
@@ -75,19 +88,17 @@ def load_abide_list(data_type, fold_idx=0, num_folds=5, seed=100):
     elif data_type == "test":
         selected_files = [valid_files[i] for i in test_idx]
     else:
-        raise ValueError("data_type은 'train' 또는 'test'여야 합니다.")
+        raise ValueError("data_type must be 'train' or 'test'.")
     print(f"Fold {fold_idx+1}/{num_folds}, {data_type} set: {len(selected_files)} files")
     return np.array(selected_files)
 
 
 class GraphDataset(Dataset):
-    def __init__(self, data_filenames, device):
+    def __init__(self, data_filenames, data_dir, phenotype_csv):
         super(GraphDataset, self).__init__()
-        self.abide_path = '/yourpath'
-        self.phenotype_path = '/yourpath'
-        self.device = device
+        self.abide_path = data_dir
 
-        self.df = pd.read_csv(self.phenotype_path)
+        self.df = pd.read_csv(phenotype_csv)
         self.df['FILE_ID'] = self.df['FILE_ID'].astype(str).str.strip()
         self.df = self.df.set_index('FILE_ID', drop=False)
         self.site_to_num = {site: i for i, site in enumerate(self.df['SITE_ID'].unique())}
@@ -99,7 +110,7 @@ class GraphDataset(Dataset):
     def _load_data(self):
         data_list = []
         for filename in self.data_filenames:
-            file_path = os.path.join(self.abide_path, filename)
+            file_path = self.abide_path / filename
             file_id = filename.replace('_rois_aal.1D', '').strip()
 
             if file_id not in self.df.index:
@@ -113,20 +124,9 @@ class GraphDataset(Dataset):
                 np.fill_diagonal(corr_matrix, 1)
 
                 node_features = corr_matrix
-                i, j = np.triu_indices(node_features.shape[0], k=1)
-                non_zero_values = np.abs(node_features)[i, j]
-                non_zero_values = non_zero_values[non_zero_values != 0]
-                threshold = np.percentile(non_zero_values, 40)
-
-                upper_tri = np.zeros_like(node_features, dtype=bool)
-                upper_tri[i, j] = np.abs(node_features)[i, j] > threshold
-                symmetric_adj = upper_tri | upper_tri.T
-
-                rows, cols = np.where(symmetric_adj)
-                self_loops = np.arange(node_features.shape[0])
-                all_rows = np.concatenate([rows, self_loops])
-                all_cols = np.concatenate([cols, self_loops])
-                edge_index = np.unique(np.stack([all_rows, all_cols]), axis=1)
+                if not np.isfinite(node_features).all():
+                    continue
+                edge_index = fc_topk_edges(node_features)
 
                 label = int(self.df.loc[file_id, 'DX_GROUP'] == 1)
                 site_num = self.df.loc[file_id, 'SITE_NUM']
@@ -147,8 +147,10 @@ class GraphDataset(Dataset):
         return self.data_list[idx]
 
 
-def make_symmetric(edge_index: torch.Tensor) -> torch.Tensor:
-    return torch.cat([edge_index, edge_index[[1, 0]]], dim=1)
+def make_symmetric_with_self_loops(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    nodes = torch.arange(num_nodes, device=edge_index.device)
+    loops = torch.stack([nodes, nodes], dim=0)
+    return torch.cat([edge_index, edge_index[[1, 0]], loops], dim=1)
 
 
 def negative_sampling_upper(data, device, undirected=True):
@@ -186,7 +188,7 @@ def negative_sampling_upper(data, device, undirected=True):
 
 
 class MLPEdgeDecoder(nn.Module):
-    def __init__(self, embed_channels, hidden_dim=64, device='cuda'):
+    def __init__(self, embed_channels, hidden_dim=64):
         super().__init__()
         self.fc1 = nn.Linear(3 * embed_channels, hidden_dim)
         self.layer_norm1 = nn.LayerNorm(hidden_dim)
@@ -205,13 +207,12 @@ class MLPEdgeDecoder(nn.Module):
 
 
 class MLPNNodeDecoder(nn.Module):
-    def __init__(self, embed_channels, hidden_dim=64, num_nodes=116, original_feature_dim=116, device='cpu'):
+    def __init__(self, embed_channels, hidden_dim=64, num_nodes=116, original_feature_dim=116):
         super().__init__()
         self.embed_channels = embed_channels
         self.hidden_dim = hidden_dim
         self.num_nodes = num_nodes
         self.original_feature_dim = original_feature_dim
-        self.device = device
         self.conv1 = SAGEConv(embed_channels, embed_channels)
         self.conv2 = SAGEConv(embed_channels, embed_channels)
         self.fc1 = nn.Linear(embed_channels * num_nodes, hidden_dim * num_nodes)
@@ -240,12 +241,10 @@ class MLPNNodeDecoder(nn.Module):
 
 class PT_GraphVAE(nn.Module):
     def __init__(self, in_channels, hidden_channels, embed_channels,
-                 original_feature_dim, num_nodes=116, device='cpu', default_rho=0.6):
+                 original_feature_dim, num_nodes=116):
         super().__init__()
         self.num_nodes = num_nodes
-        self.device = device
         self.embed_channels = embed_channels
-        self.default_rho = default_rho
 
         self.conv1 = SAGEConv(in_channels, hidden_channels)
         self.conv2 = SAGEConv(hidden_channels, hidden_channels)
@@ -258,11 +257,11 @@ class PT_GraphVAE(nn.Module):
         self.edge_mu = nn.Linear(embed_channels, embed_channels)
         self.edge_logvar = nn.Linear(embed_channels, embed_channels)
 
-        self.edge_decoder = MLPEdgeDecoder(embed_channels, 64, device)
-        self.node_decoder = MLPNNodeDecoder(embed_channels, 64, num_nodes, original_feature_dim, device)
+        self.edge_decoder = MLPEdgeDecoder(embed_channels, 64)
+        self.node_decoder = MLPNNodeDecoder(embed_channels, 64, num_nodes, original_feature_dim)
 
     def encode_graph(self, x, edge_index_upper):
-        edge_full = make_symmetric(edge_index_upper)
+        edge_full = make_symmetric_with_self_loops(edge_index_upper, x.size(0))
         h = self.act(self.conv1(x, edge_full))
         h = self.act(self.conv2(h, edge_full))
         node_mu, node_lv = self.node_mu(h), self.node_logvar(h)
@@ -278,7 +277,7 @@ class PT_GraphVAE(nn.Module):
         std = torch.exp(0.5 * logvar)
         return mu + torch.randn_like(std) * std
 
-    def forward(self, x, pos_edge_index, neg_edge_index, original_features, batch, y, sw_ratio):
+    def forward(self, x, pos_edge_index, neg_edge_index, original_features, batch):
         z_edge, e_mu, e_lv, z_node, n_mu, n_lv = self.encode_graph(x, pos_edge_index)
 
         pos_logit = self.edge_decoder(z_edge, pos_edge_index)
@@ -287,27 +286,20 @@ class PT_GraphVAE(nn.Module):
         labels = torch.cat([torch.ones_like(pos_logit), torch.zeros_like(neg_logit)])
         loss_edges = self.edge_decoder.edge_loss_fn(logits, labels)
 
-        logits_all = torch.cat([pos_logit, neg_logit])
-        edges_all = torch.cat([pos_edge_index, neg_edge_index], dim=1)
-        probs_all = torch.sigmoid(logits_all)
-        src = edges_all[0]
-        gids = batch[src]
-        keep_ratio = 0.6
         keep_edges = []
+        B = int(batch.max().item()) + 1
+        for g in range(B):
+            nodes = (batch == g).nonzero(as_tuple=False).flatten()
+            row, col = torch.triu_indices(nodes.numel(), nodes.numel(), offset=1, device=x.device)
+            candidate_edges = torch.stack([nodes[row], nodes[col]], dim=0)
+            candidate_logits = self.edge_decoder(z_edge, candidate_edges)
+            k = fixed_upper_edge_count(nodes.numel())
+            top_idx = torch.topk(candidate_logits, k=k).indices
+            keep_edges.append(candidate_edges[:, top_idx])
 
-        for g in torch.unique(gids):
-            mask = (gids == g)
-            idxs = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-            if idxs.numel() == 0:
-                continue
-            k_g = max(1, int(keep_ratio * idxs.numel()))
-            _, topk_local = torch.topk(probs_all[idxs], k_g)
-            keep_edges.append(edges_all[:, idxs[topk_local]])
+        rec_upper = torch.cat(keep_edges, dim=1)
+        edge_full = make_symmetric_with_self_loops(rec_upper, x.size(0))
 
-        rec_upper = torch.cat(keep_edges, dim=1) if keep_edges else edges_all[:, :0]
-        edge_full = make_symmetric(rec_upper)
-
-        B = batch.max().item() + 1
         x_rec = self.node_decoder(z_node, edge_full, B)
         loss_nodes = self.node_decoder.node_loss_fn(x_rec, original_features)
 
@@ -323,36 +315,34 @@ class PT_GraphVAE(nn.Module):
         z_edge, _, _, z_node, _, _ = self.encode_graph(x, edge_index_upper)
         return torch.cat([z_edge, z_node], dim=1)
 
-    def latent_to_graph(self, z_latent, batch_size, num_nodes=116, rho=None):
+    def latent_to_graph(self, z_latent, batch_size, num_nodes=116):
         z_edge, z_node = torch.chunk(z_latent, chunks=2, dim=1)
 
-        i, j = torch.triu_indices(num_nodes, num_nodes, offset=1, device=self.device)
+        i, j = torch.triu_indices(num_nodes, num_nodes, offset=1, device=z_latent.device)
         edge_upper = torch.stack([i, j], dim=0)
 
         logits = self.edge_decoder(z_edge, edge_upper)
-        probs = torch.sigmoid(logits)
-
-        M = edge_upper.shape[1]
-        rho = self.default_rho if (rho is None) else float(rho)
-        K = max(1, int(round(rho * M)))
-        _, topk_idx = torch.topk(probs, K)
+        K = fixed_upper_edge_count(num_nodes)
+        topk_idx = torch.topk(logits, K).indices
         rec_upper = edge_upper[:, topk_idx]
-        selected_edges = make_symmetric(rec_upper)
+        selected_edges = make_symmetric_with_self_loops(rec_upper, num_nodes)
 
         x_reconstructed = self.node_decoder(z_node, selected_edges, batch_size)
         return x_reconstructed, selected_edges
 
-    def latent_to_graph_batch(self, z_batch: torch.Tensor, num_nodes=116, rho=None):
+    def latent_to_graph_batch(self, z_batch: torch.Tensor, num_nodes=116):
         B, N, _ = z_batch.shape
+        if N != num_nodes:
+            raise ValueError("Latent node count does not match num_nodes.")
         out_x, out_e = [], []
         for b in range(B):
-            x_r, e_r = self.latent_to_graph(z_batch[b], 1, num_nodes, rho=rho)
+            x_r, e_r = self.latent_to_graph(z_batch[b], 1, num_nodes)
             out_x.append(x_r)
             out_e.append(e_r)
         return torch.stack(out_x), out_e
 
 
-def train_gae(model, optimizer, scheduler, train_loader, device, epoch, sw_ratio):
+def train_gae(model, optimizer, scheduler, train_loader, device):
     model.train()
     total_loss = 0
     for data in train_loader:
@@ -365,7 +355,7 @@ def train_gae(model, optimizer, scheduler, train_loader, device, epoch, sw_ratio
         neg_edge_index = negative_sampling_upper(data, device=device, undirected=False)
         original_features = data.x
 
-        loss, _, _, _ = model(data.x, pos_edge_index, neg_edge_index, original_features, data.batch, data.y, sw_ratio)
+        loss, _, _, _ = model(data.x, pos_edge_index, neg_edge_index, original_features, data.batch)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -584,14 +574,14 @@ def get_graph_labels_from_batch(batch: Data) -> torch.Tensor:
     )
 
 
-def main():
+def main(data_dir, phenotype_csv, output_dir):
     default_config = {
         "model_name": "ID_PT_Diff_5fold",
         "seed": 100,
         "num_nodes": 116,
         "num_folds": 5
     }
-    wandb.init(project="ID_PT_Diff_10fold", config=default_config)
+    wandb.init(project="ID_PT_Diff", config=default_config)
     config = wandb.config
 
     device = f'cuda:{config["gpu_id"]}' if torch.cuda.is_available() else 'cpu'
@@ -605,21 +595,16 @@ def main():
         set_seed(seed)
         for fold_idx in range(num_folds):
             print(f"\n=== Training with seed={seed}, fold={fold_idx+1}/{num_folds} ===")
-            result_dir = (
-                f"/yourpath"
-                f"fold_{fold_idx}_ID_drop_{config['cond_drop_prob']}"
-                f"_timestep_{config['timesteps']}_diff_{config['cond_epochs']}_emb_{config['embed_channels']}"
-                f"_hidden_{config['hidden_channels']}_vae{config['vae_epochs']}_cfg_{config['guidance_scale']}"
-                f"/diff_cond_seed_{seed}"
-            )
+            result_dir = output_dir / wandb.run.id / f"fold_{fold_idx}"
             os.makedirs(result_dir, exist_ok=True)
             samples_dir = os.path.join(result_dir, "samples")
             os.makedirs(samples_dir, exist_ok=True)
 
-            train_files = load_abide_list("train", fold_idx=fold_idx, num_folds=num_folds)
-            test_files = load_abide_list("test", fold_idx=fold_idx, num_folds=num_folds)
+            train_files = load_abide_list("train", data_dir, phenotype_csv, fold_idx=fold_idx, num_folds=num_folds)
 
-            train_dataset = GraphDataset(data_filenames=train_files, device=device)
+            train_dataset = GraphDataset(train_files, data_dir, phenotype_csv)
+            if len(train_dataset) < config["batch_size"]:
+                raise ValueError("Training set is smaller than batch_size after filtering.")
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=config["batch_size"],
@@ -634,8 +619,10 @@ def main():
             hidden_channels = config["hidden_channels"]
             embed_channels = config["embed_channels"]
             num_nodes = config["num_nodes"]
+            if in_channels != num_nodes:
+                raise ValueError("Data node count does not match num_nodes.")
 
-            model = PT_GraphVAE(in_channels, hidden_channels, embed_channels, in_channels, num_nodes, device).to(device)
+            model = PT_GraphVAE(in_channels, hidden_channels, embed_channels, in_channels, num_nodes).to(device)
             initialize_weights(model)
             print("Initialized PT_GraphVAE")
 
@@ -665,7 +652,7 @@ def main():
 
             print(f"Starting GAE training for {num_epochs_gae} epochs")
             for epoch in range(1, num_epochs_gae + 1):
-                train_loss = train_gae(model, optimizer_gae, scheduler_gae, train_loader, device, epoch, sw_ratio)
+                train_loss = train_gae(model, optimizer_gae, scheduler_gae, train_loader, device)
                 if epoch % 10 == 0:
                     print(f"Epoch {epoch}/{num_epochs_gae}, GAE train loss: {train_loss:.4f}")
                 wandb.log({"phase": "GAE_train", "vae_epoch": epoch, "train_loss": train_loss, "seed": seed})
@@ -676,7 +663,6 @@ def main():
             latent_std_b = latent_std.view(1, 1, D)
             print("[Latent stats] mean|std:", float(latent_mean.abs().mean()), float(latent_std.mean()))
 
-            rho_fixed = 0.6
             cond_enc = EnhancedConditionEncoder().to(device)
             eps_model = NodeTransformerEps(
                 latent_dim=embed_channels * 2,
@@ -779,12 +765,11 @@ def main():
 
                     global_step += 1
                     if global_step % 10 == 0:
-                        wandb.log({"diff/global_step": global_step, "diff/lr": lr_now}, step=global_step)
+                        wandb.log({"diff/global_step": global_step, "diff/lr": lr_now})
 
                 diff_loss = total_loss / steps_per_epoch
                 wandb.log(
-                    {"diff/global_step": global_step, "diff/loss": diff_loss, "diff/epoch": epoch, "seed": seed},
-                    step=global_step
+                    {"diff/global_step": global_step, "diff/loss": diff_loss, "diff/epoch": epoch, "seed": seed}
                 )
 
                 if epoch % 10 == 0:
@@ -833,7 +818,7 @@ def main():
                             )
                             z_batch = z_batch_norm * latent_std_b + latent_mean_b
 
-                            x_rec, e_rec = model.latent_to_graph_batch(z_batch, num_nodes=num_nodes, rho=rho_fixed)
+                            x_rec, e_rec = model.latent_to_graph_batch(z_batch, num_nodes=num_nodes)
 
                             for b in range(bs):
                                 x2d = x_rec[b].detach().cpu().numpy()
@@ -875,9 +860,20 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--phenotype-csv", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=Path("results"))
+    args = parser.parse_args()
+    args.data_dir = args.data_dir.expanduser().resolve()
+    args.phenotype_csv = args.phenotype_csv.expanduser().resolve()
+    args.output_dir = args.output_dir.expanduser().resolve()
+    if not args.data_dir.is_dir() or not args.phenotype_csv.is_file():
+        parser.error("--data-dir must be a directory and --phenotype-csv must be a file")
+
     sweep_config = {
         "method": "grid",
-        "metric": {"name": "eval_loss", "goal": "minimize"},
+        "metric": {"name": "diff/loss", "goal": "minimize"},
         "parameters": {
             "gpu_id": {"values": [0]},
             "vae_epochs": {"values": [300]},
@@ -894,6 +890,6 @@ if __name__ == "__main__":
             "num_folds": {"values": [5]}
         }
     }
-    sweep_id = wandb.sweep(sweep_config, project="DiT_5fold")
+    sweep_id = wandb.sweep(sweep_config, project="ID_PT_Diff")
     print(f"Sweep ID: {sweep_id}")
-    wandb.agent(sweep_id, function=main)
+    wandb.agent(sweep_id, function=lambda: main(args.data_dir, args.phenotype_csv, args.output_dir))
