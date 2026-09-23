@@ -3,6 +3,9 @@ import os
 import math
 import random
 from pathlib import Path
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -50,12 +53,10 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    os.environ.pop('CUBLAS_WORKSPACE_CONFIG', None)
     os.environ['PYTHONHASHSEED'] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
 def initialize_weights(model):
@@ -472,7 +473,7 @@ class DiffusionNodes(nn.Module):
         f = np.cos(((t / T) + s) / (1 + s) * np.pi / 2) ** 2
         abar = f / f[0]
         betas = 1 - (abar[1:] / abar[:-1])
-        betas = np.clip(betas, 1e-6, 0.02).astype(np.float32)
+        betas = np.clip(betas, 1e-6, 0.999).astype(np.float32)
         betas = torch.from_numpy(betas).to(device)
         alphas = 1.0 - betas
         abar = torch.cumprod(alphas, dim=0)
@@ -776,6 +777,8 @@ def main(data_dir, phenotype_csv, output_dir):
                     print(f"[TransDiff] seed={seed}, epoch={epoch}/{num_epochs_diff}, loss={diff_loss:.4f}")
 
                 if epoch % config['cond_epochs'] == 0:
+                    eps_model.eval()
+                    cond_enc.eval()
                     model_save_dir = os.path.join(result_dir, "models")
                     os.makedirs(model_save_dir, exist_ok=True)
                     torch.save(model.state_dict(), os.path.join(model_save_dir, f"gae_seed_{seed}_epoch_{epoch}.pth"))
@@ -802,7 +805,8 @@ def main(data_dir, phenotype_csv, output_dir):
                         while need > 0:
                             bs = min(sample_bs, need)
                             lab = torch.full((bs,), cls, device=device)
-                            cond_vec = cond_enc(lab)
+                            with torch.no_grad():
+                                cond_vec = cond_enc(lab)
 
                             z_batch_norm = sample_with_ddim_cfg_nodes_v(
                                 eps_model,
