@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import math
 import random
@@ -22,7 +23,6 @@ from torch_geometric.nn import SAGEConv
 from torch_geometric.loader import DataLoader
 from torch_geometric.utils import to_dense_adj
 from torch_geometric.data import Dataset, Data
-import wandb
 from datetime import datetime
 
 
@@ -240,7 +240,7 @@ class MLPNNodeDecoder(nn.Module):
         return F.mse_loss(x_reconstructed, x)
 
 
-class PT_GraphVAE(nn.Module):
+class PT_VGAE(nn.Module):
     def __init__(self, in_channels, hidden_channels, embed_channels,
                  original_feature_dim, num_nodes=116):
         super().__init__()
@@ -288,15 +288,19 @@ class PT_GraphVAE(nn.Module):
         loss_edges = self.edge_decoder.edge_loss_fn(logits, labels)
 
         keep_edges = []
+        candidate_edges = torch.cat([pos_edge_index, neg_edge_index], dim=1)
+        # Use sampled BCE candidates, but fix the output count relative to all pairs.
         B = int(batch.max().item()) + 1
         for g in range(B):
             nodes = (batch == g).nonzero(as_tuple=False).flatten()
-            row, col = torch.triu_indices(nodes.numel(), nodes.numel(), offset=1, device=x.device)
-            candidate_edges = torch.stack([nodes[row], nodes[col]], dim=0)
-            candidate_logits = self.edge_decoder(z_edge, candidate_edges)
+            mask = (batch[candidate_edges[0]] == g) & (batch[candidate_edges[1]] == g)
+            graph_edges = candidate_edges[:, mask]
+            candidate_logits = logits[mask]
             k = fixed_upper_edge_count(nodes.numel())
+            if graph_edges.shape[1] < k:
+                raise ValueError(f"graph {g}: {graph_edges.shape[1]} candidates cannot supply {k} edges")
             top_idx = torch.topk(candidate_logits, k=k).indices
-            keep_edges.append(candidate_edges[:, top_idx])
+            keep_edges.append(graph_edges[:, top_idx])
 
         rec_upper = torch.cat(keep_edges, dim=1)
         edge_full = make_symmetric_with_self_loops(rec_upper, x.size(0))
@@ -575,15 +579,15 @@ def get_graph_labels_from_batch(batch: Data) -> torch.Tensor:
     )
 
 
-def main(data_dir, phenotype_csv, output_dir):
-    default_config = {
-        "model_name": "ID_PT_Diff_5fold",
-        "seed": 100,
-        "num_nodes": 116,
-        "num_folds": 5
-    }
-    wandb.init(project="ID_PT_Diff", config=default_config)
-    config = wandb.config
+def main(data_dir, phenotype_csv, output_dir, config):
+    run_dir = output_dir / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_cfg{config['guidance_scale']:g}")
+    run_dir.mkdir(parents=True, exist_ok=False)
+    (run_dir / "config.json").write_text(json.dumps(dict(config, data_dir=str(data_dir),
+        phenotype_csv=str(phenotype_csv), edge_ratio=EDGE_RATIO), indent=2) + "\n")
+
+    def log_metrics(values):
+        with (run_dir / "metrics.jsonl").open("a") as handle:
+            handle.write(json.dumps(dict(values, fold=fold_idx), allow_nan=False) + "\n")
 
     device = f'cuda:{config["gpu_id"]}' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
@@ -595,15 +599,19 @@ def main(data_dir, phenotype_csv, output_dir):
     for seed in seeds:
         set_seed(seed)
         for fold_idx in range(num_folds):
+            if fold_idx not in config["folds"]:
+                continue
             print(f"\n=== Training with seed={seed}, fold={fold_idx+1}/{num_folds} ===")
-            result_dir = output_dir / wandb.run.id / f"fold_{fold_idx}"
+            result_dir = run_dir / f"fold_{fold_idx}"
             os.makedirs(result_dir, exist_ok=True)
             samples_dir = os.path.join(result_dir, "samples")
             os.makedirs(samples_dir, exist_ok=True)
 
-            train_files = load_abide_list("train", data_dir, phenotype_csv, fold_idx=fold_idx, num_folds=num_folds)
+            train_files = load_abide_list("train", data_dir, phenotype_csv, fold_idx=fold_idx, num_folds=num_folds, seed=seed)
 
             train_dataset = GraphDataset(train_files, data_dir, phenotype_csv)
+            if config["smoke"]:
+                train_dataset.data_list = train_dataset.data_list[:128]
             if len(train_dataset) < config["batch_size"]:
                 raise ValueError("Training set is smaller than batch_size after filtering.")
             train_loader = DataLoader(
@@ -623,9 +631,9 @@ def main(data_dir, phenotype_csv, output_dir):
             if in_channels != num_nodes:
                 raise ValueError("Data node count does not match num_nodes.")
 
-            model = PT_GraphVAE(in_channels, hidden_channels, embed_channels, in_channels, num_nodes).to(device)
+            model = PT_VGAE(in_channels, hidden_channels, embed_channels, in_channels, num_nodes).to(device)
             initialize_weights(model)
-            print("Initialized PT_GraphVAE")
+            print("Initialized PT_VGAE")
 
             optimizer_gae = optim.AdamW(
                 model.parameters(),
@@ -656,7 +664,7 @@ def main(data_dir, phenotype_csv, output_dir):
                 train_loss = train_gae(model, optimizer_gae, scheduler_gae, train_loader, device)
                 if epoch % 10 == 0:
                     print(f"Epoch {epoch}/{num_epochs_gae}, GAE train loss: {train_loss:.4f}")
-                wandb.log({"phase": "GAE_train", "vae_epoch": epoch, "train_loss": train_loss, "seed": seed})
+                log_metrics({"phase": "GAE_train", "vae_epoch": epoch, "train_loss": train_loss, "seed": seed})
 
             D = embed_channels * 2
             latent_mean, latent_std = compute_latent_stats(model, train_loader, device, num_nodes, D)
@@ -708,9 +716,6 @@ def main(data_dir, phenotype_csv, output_dir):
 
             steps_per_epoch = len(train_loader)
             total_diff_steps = num_epochs_diff * steps_per_epoch
-
-            wandb.define_metric("diff/global_step")
-            wandb.define_metric("diff/*", step_metric="diff/global_step")
 
             pbar_all = tqdm(
                 total=total_diff_steps,
@@ -766,10 +771,10 @@ def main(data_dir, phenotype_csv, output_dir):
 
                     global_step += 1
                     if global_step % 10 == 0:
-                        wandb.log({"diff/global_step": global_step, "diff/lr": lr_now})
+                        log_metrics({"diff/global_step": global_step, "diff/lr": lr_now})
 
                 diff_loss = total_loss / steps_per_epoch
-                wandb.log(
+                log_metrics(
                     {"diff/global_step": global_step, "diff/loss": diff_loss, "diff/epoch": epoch, "seed": seed}
                 )
 
@@ -789,6 +794,8 @@ def main(data_dir, phenotype_csv, output_dir):
                     real_labels = [data.y.item() for data in train_dataset.data_list]
                     class_counts = Counter(real_labels)
                     desired_counts = {cls: class_counts.get(1 - cls, 0) for cls in class_counts}
+                    if config["smoke"]:
+                        desired_counts = {cls: min(2, count) for cls, count in desired_counts.items()}
                     generated_counts = {cls: 0 for cls in desired_counts.keys()}
 
                     all_node_features, all_edge_indices, all_labels = [], [], []
@@ -861,6 +868,7 @@ def main(data_dir, phenotype_csv, output_dir):
                         labels=labels_np
                     )
                     print(f"Saved all matched samples at {sample_save_path}")
+            pbar_all.close()
 
 
 if __name__ == "__main__":
@@ -868,6 +876,14 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--phenotype-csv", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
+    parser.add_argument("--gpu-id", type=int, default=0, help="Logical GPU index; prefer CUDA_VISIBLE_DEVICES.")
+    parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--vae-epochs", type=int, default=100)
+    parser.add_argument("--cond-epochs", type=int, default=100)
+    parser.add_argument("--num-folds", type=int, default=5)
+    parser.add_argument("--folds", nargs="+", type=int)
+    parser.add_argument("--guidance-scales", nargs="+", type=float, default=[9.5, 10.0])
+    parser.add_argument("--smoke", action="store_true", help="One fold, 128 training subjects, one epoch per stage, at most 4 synthetic samples.")
     args = parser.parse_args()
     args.data_dir = args.data_dir.expanduser().resolve()
     args.phenotype_csv = args.phenotype_csv.expanduser().resolve()
@@ -875,25 +891,18 @@ if __name__ == "__main__":
     if not args.data_dir.is_dir() or not args.phenotype_csv.is_file():
         parser.error("--data-dir must be a directory and --phenotype-csv must be a file")
 
-    sweep_config = {
-        "method": "grid",
-        "metric": {"name": "diff/loss", "goal": "minimize"},
-        "parameters": {
-            "gpu_id": {"values": [0]},
-            "vae_epochs": {"values": [300]},
-            "cond_epochs": {"values": [1000]},
-            "batch_size": {"values": [64]},
-            "sample_batch_size": {"values": [64]},
-            "learning_rate_gae": {"values": [1e-4]},
-            "learning_rate_diff": {"values": [1e-4]},
-            "guidance_scale": {"values": [9.5, 10]},
-            "cond_drop_prob": {"values": [0.1]},
-            "hidden_channels": {"values": [64]},
-            "embed_channels": {"values": [32]},
-            "timesteps": {"values": [100]},
-            "num_folds": {"values": [5]}
-        }
-    }
-    sweep_id = wandb.sweep(sweep_config, project="ID_PT_Diff")
-    print(f"Sweep ID: {sweep_id}")
-    wandb.agent(sweep_id, function=lambda: main(args.data_dir, args.phenotype_csv, args.output_dir))
+    if args.num_folds < 2 or min(args.vae_epochs, args.cond_epochs) < 1:
+        parser.error("num-folds must be >=2 and epochs positive")
+    folds = args.folds if args.folds is not None else list(range(args.num_folds))
+    if any(f < 0 or f >= args.num_folds for f in folds):
+        parser.error("fold indices must be in [0, num-folds)")
+    if args.smoke:
+        folds = folds[:1]
+    config = dict(seed=args.seed, num_nodes=116, num_folds=args.num_folds, folds=folds,
+        gpu_id=args.gpu_id, vae_epochs=1 if args.smoke else args.vae_epochs,
+        cond_epochs=1 if args.smoke else args.cond_epochs, batch_size=64, sample_batch_size=64,
+        learning_rate_gae=1e-4, learning_rate_diff=1e-4, cond_drop_prob=.1,
+        hidden_channels=64, embed_channels=32, timesteps=100, smoke=args.smoke)
+    scales = args.guidance_scales[:1] if args.smoke else args.guidance_scales
+    for scale in scales:
+        main(args.data_dir, args.phenotype_csv, args.output_dir, dict(config, guidance_scale=scale))
